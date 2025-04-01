@@ -47,29 +47,36 @@ class BEVFusion(Base3DDetector):
         seg_head: Optional[dict] = None,
         **kwargs,
     ) -> None:
-        voxelize_cfg = data_preprocessor.pop('voxelize_cfg')
-        super().__init__(
-            data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        # === 安全处理 voxelize_cfg ===
+        voxelize_cfg = None
+        if data_preprocessor is not None and 'voxelize_cfg' in data_preprocessor:
+            voxelize_cfg = data_preprocessor.pop('voxelize_cfg')
 
-        self.voxelize_reduce = voxelize_cfg.pop('voxelize_reduce')
-        self.pts_voxel_layer = Voxelization(**voxelize_cfg)
+        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.pts_voxel_encoder = MODELS.build(pts_voxel_encoder)
+        if voxelize_cfg is not None:
+            self.voxelize_reduce = voxelize_cfg.pop('voxelize_reduce', False)
+            self.pts_voxel_layer = Voxelization(**voxelize_cfg)
+        else:
+            self.voxelize_reduce = False
+            self.pts_voxel_layer = None
 
-        self.img_backbone = MODELS.build(
-            img_backbone) if img_backbone is not None else None
-        self.img_neck = MODELS.build(
-            img_neck) if img_neck is not None else None
-        self.view_transform = MODELS.build(
-            view_transform) if view_transform is not None else None
-        self.pts_middle_encoder = MODELS.build(pts_middle_encoder)
+        # === 点云分支 ===
+        self.pts_voxel_encoder = MODELS.build(pts_voxel_encoder) if pts_voxel_encoder is not None else None
+        self.pts_middle_encoder = MODELS.build(pts_middle_encoder) if pts_middle_encoder is not None else None
+        self.pts_backbone = MODELS.build(pts_backbone) if pts_backbone is not None else None
+        self.pts_neck = MODELS.build(pts_neck) if pts_neck is not None else None
 
-        self.map_feat_encoder = MODELS.build(
-            map_feat_encoder) if map_feat_encoder is not None else None
+        # === 图像分支 ===
+        self.img_backbone = MODELS.build(img_backbone) if img_backbone is not None else None
+        self.img_neck = MODELS.build(img_neck) if img_neck is not None else None
+        self.view_transform = MODELS.build(view_transform) if view_transform is not None else None
 
+        # === 地图分支 ===
+        self.map_feat_encoder = MODELS.build(map_feat_encoder) if map_feat_encoder is not None else None
+
+        # === 蒸馏模块 DiffKD ===
         self.distill_cfg = kwargs.get("distill_cfg", {})
-
-        # 实例化 DiffKD 模块：只在启用时创建
         self.diffkd_map_img = None
         self.diffkd_map_pts = None
 
@@ -91,13 +98,9 @@ class BEVFusion(Base3DDetector):
                 distill_cfg=self.distill_cfg,
             )
 
-        self.fusion_layer = MODELS.build(
-            fusion_layer) if fusion_layer is not None else None
-
-        self.pts_backbone = MODELS.build(pts_backbone)
-        self.pts_neck = MODELS.build(pts_neck)
-
-        self.bbox_head = MODELS.build(bbox_head)
+        # === 融合层和检测头 ===
+        self.fusion_layer = MODELS.build(fusion_layer) if fusion_layer is not None else None
+        self.bbox_head = MODELS.build(bbox_head) if bbox_head is not None else None
 
         self.init_weights()
 
@@ -214,26 +217,10 @@ class BEVFusion(Base3DDetector):
 
         return x
 
-    
-    def get_map_mask_queryinit(self, map_mask: Tensor, target_size=(180, 180)) -> Tensor:
-        """将原始 map_mask 生成 query 初始化用的 BEV 引导图 (B, 1, H, W)"""
-        if map_mask.dim() == 3:
-            map_mask = map_mask.unsqueeze(1)
-        elif map_mask.dim() == 4:
-            map_mask = map_mask.max(dim=1, keepdim=True)[0]
-        Qmap_mask = F.interpolate(map_mask.float(), size=target_size, mode='nearest')
-        return Qmap_mask
-
-
     def extract_map_feat(self, batch_inputs_dict) -> torch.Tensor:
         """提取地图特征，同时保留一份用于 query 初始化的 BEV 掩码"""
         map_mask = batch_inputs_dict.get('map_mask', None)
         
-        # 仅用于 query 初始化，不影响主干地图编码器
-        map_mask_for_query = map_mask.clone().detach()
-        self.map_mask_bev = self.get_map_mask_queryinit(map_mask_for_query)
-        # print("✅ self.map_mask_bev shape:", self.map_mask_bev.shape)
-        # print("✅ self.map_mask_bev unique values:", torch.unique(self.map_mask_bev))
         
         x = map_mask
         if self.map_feat_encoder:
@@ -354,18 +341,10 @@ class BEVFusion(Base3DDetector):
         # 2. 提取地图特征（教师）
         if map_mask is not None:
             map_feature = self.extract_map_feat(batch_inputs_dict)
-            # 重要：确保每次提取完地图特征后，立即将 map_mask_bev 传递给 bbox_head
-            if hasattr(self, 'bbox_head'):
-                # 首先确保 bbox_head 有这个属性
-                if not hasattr(self.bbox_head, 'map_mask_bev'):
-                    # 动态添加属性
-                    setattr(self.bbox_head, 'map_mask_bev', None)
-                # 然后设置值
-                self.bbox_head.map_mask_bev = self.map_mask_bev
-                # print("✅ Successfully set map_mask_bev to bbox_head")
+
 
         # 3. 提取点云特征
-        pts_feature = self.extract_pts_feat(batch_inputs_dict)
+        # pts_feature = self.extract_pts_feat(batch_inputs_dict)
 
         # ============ DiffKD 蒸馏过程（map -> img 和 map -> pts） ============
 
@@ -418,22 +397,9 @@ class BEVFusion(Base3DDetector):
             assert len(features) == 1, features
             x = features[0]
 
-        x = self.pts_backbone(x)
-        x = self.pts_neck(x)
-        # 再次确保 map_mask_bev 被正确传递
-        if hasattr(self, 'map_mask_bev') and self.map_mask_bev is not None:
-            if hasattr(self.bbox_head, 'map_mask_bev'):
-                self.bbox_head.map_mask_bev = self.map_mask_bev
-                # print("✅ Double-check: map_mask_bev is set to bbox_head")
-        # print("🔥 输入 TransFusionHead 前的特征：")
-        # if isinstance(x, list):
-        #     for i, feat in enumerate(x):
-        #         print(f"  ⤷ Neck输出[{i}] shape: {feat.shape}")
-        #     print(f"  ⤷ 拼接后输入 shape: {torch.cat(x, dim=1).shape}")
-        # else:
-        #     print(f"  ⤷ 单通道输入 shape: {x.shape}")
+        # x = self.pts_backbone(x)
+        # x = self.pts_neck(x)
 
-        # 如果训练模式，返回特征 + 蒸馏损失
         if self.training:
             return x, diffkd_losses
         else:

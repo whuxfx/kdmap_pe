@@ -9,7 +9,7 @@ from mmcv.transforms import LoadImageFromFile
 from mmcv.transforms.base import BaseTransform
 from mmdet.datasets.transforms import LoadAnnotations
 from mmengine.fileio import get
-
+import os
 from mmdet3d.registry import TRANSFORMS
 from mmdet3d.structures.bbox_3d import get_box_type
 from mmdet3d.structures.points import BasePoints, get_points_type
@@ -643,6 +643,12 @@ class LoadPointsFromFile(BaseTransform):
                 - points (:obj:`BasePoints`): Point clouds data.
         """
         pts_file_path = results['lidar_points']['lidar_path']
+        # ✅ 如果路径不是绝对路径，我们拼接前缀
+        if not os.path.isabs(pts_file_path) and 'samples' not in pts_file_path:
+            pts_file_path = os.path.join('data/nuscenes/samples/LIDAR_TOP', pts_file_path)
+        
+        # print("�� [DEBUG] Final load path:", pts_file_path)
+        points = self._load_points(pts_file_path)
         points = self._load_points(pts_file_path)
         points = points.reshape(-1, self.load_dim)
         points = points[:, self.use_dim]
